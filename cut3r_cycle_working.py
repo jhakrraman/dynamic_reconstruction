@@ -29,6 +29,9 @@ class CUT3RProcessor(Node):
         self.declare_parameter('publish_depth_map', True)
         self.declare_parameter('voxel_size', 0.05)  # Downsampling resolution
         self.declare_parameter('enable_colors', True)  # Enable color extraction
+        self.declare_parameter('max_accumulated_frames', 72)  # Maximum frames to accumulate before clearing
+        self.declare_parameter('circle_radius', 1.0)  # Radius of circular motion for 360° capture
+        self.declare_parameter('rotation_speed', 5.0)  # Degrees per frame for rotation
     
         
         cut3r_path = self.get_parameter('cut3r_path').value
@@ -92,6 +95,8 @@ class CUT3RProcessor(Node):
         self.current_image = None
         self.persistent_state = None
         self.accumulated_points = []
+        self.accumulated_colors = []
+        self.accumulated_poses = []  # Store poses for each accumulated frame
         self.previous_frame = None
         
         self.get_logger().info(f"Initialized CUT3R Processor with continuous updating")
@@ -104,47 +109,27 @@ class CUT3RProcessor(Node):
         # CUT3R processes single frames continuously
         self.process_continuous_frame(cv_image)
 
-    # def estimate_pose_increment(self):
-    #     """Estimate camera pose increment for 360° reconstruction"""
-    #     # Adjust these values based on your camera movement
-    #     forward_speed = 0.5  # 5cm per frame
-    #     rotation_speed = np.radians(20)  # 3 degrees per frame
-        
-    #     # Create incremental transformation
-    #     increment = np.eye(4)
-        
-    #     # Add circular motion
-    #     increment[0, 3] = forward_speed * np.cos(self.pose_increment_angle)
-    #     increment[2, 3] = forward_speed * np.sin(self.pose_increment_angle)
-        
-    #     # Add rotation for 360° capture
-    #     increment[0, 0] = np.cos(rotation_speed)
-    #     increment[0, 2] = np.sin(rotation_speed)
-    #     increment[2, 0] = -np.sin(rotation_speed)
-    #     increment[2, 2] = np.cos(rotation_speed)
-        
-    #     # Update cumulative pose
-    #     self.current_pose = self.current_pose @ increment
-    #     self.pose_increment_angle += rotation_speed
-        
-    #     return self.current_pose
-
     def get_incremental_camera_pose(self):
+        """Get incremental camera pose for 360° capture with proper transformation tracking"""
         if not hasattr(self, 'pose_counter'):
             self.pose_counter = 0
         
         self.pose_counter += 1
         
-        # Create circular motion for 360° capture (5° per frame)
-        angle = (self.pose_counter * np.pi) / 36  # 72 frames for full circle
+        # Get parameters for circular motion
+        circle_radius = self.get_parameter('circle_radius').value
+        rotation_speed = self.get_parameter('rotation_speed').value
         
-        # Position on circle (1 meter radius)
-        x = 1.0 * np.cos(angle)
-        z = 1.0 * np.sin(angle)
+        # Create circular motion for 360° capture
+        angle_rad = np.radians(self.pose_counter * rotation_speed)
+        
+        # Position on circle
+        x = circle_radius * np.cos(angle_rad)
+        z = circle_radius * np.sin(angle_rad)
         y = 0.0  # Keep at same height
         
         # Camera looks toward center
-        look_angle = angle + np.pi
+        look_angle = angle_rad + np.pi
         
         pose = np.eye(4)
         # Rotation to look toward center
@@ -159,6 +144,21 @@ class CUT3RProcessor(Node):
         pose[2, 3] = z
         
         return pose
+
+    def transform_points_to_world_frame(self, points, camera_pose):
+        """Transform points from camera frame to world frame using camera pose"""
+        if len(points) == 0:
+            return points
+        
+        # Convert points to homogeneous coordinates
+        points_homogeneous = np.column_stack([points, np.ones(len(points))])
+        
+        # Transform points using camera pose (inverse because we want world coordinates)
+        camera_pose_inv = np.linalg.inv(camera_pose)
+        transformed_points_homogeneous = (camera_pose_inv @ points_homogeneous.T).T
+        
+        # Return 3D coordinates (remove homogeneous coordinate)
+        return transformed_points_homogeneous[:, :3]
 
     def voxel_grid_downsample(self, points, colors, voxel_size=0.05):
         """Downsample point cloud using voxel grid filtering"""
@@ -321,6 +321,8 @@ class CUT3RProcessor(Node):
         self.persistent_state = None
         self.previous_frame = None
         self.accumulated_points = []
+        self.accumulated_colors = []
+        self.accumulated_poses = []
         self.frame_count = 0
         self.get_logger().info("CUT3R persistent state reset for new sequence")
     
@@ -437,12 +439,12 @@ class CUT3RProcessor(Node):
 
     
     def publish_accumulated_point_cloud(self, pred):
-        """Publish accumulated dense reconstruction with color and downsampling"""
+        """Publish accumulated dense reconstruction with proper frame transformations"""
         if not self.get_parameter('publish_aggregated_pointcloud').value:
             return
 
         try:
-            # Extract and accumulate points for dense reconstruction
+            # Extract points from CUT3R prediction
             if 'pts3d' in pred:
                 points = pred['pts3d'].squeeze().cpu().numpy()
             elif 'pts3d_in_other_view' in pred:
@@ -460,39 +462,55 @@ class CUT3RProcessor(Node):
             # Extract colors from the current image
             colors = self.extract_colors_from_image(points, self.current_image)
 
+            # Get current camera pose
+            current_pose = self.get_incremental_camera_pose()
+            
+            # Transform points from camera frame to world frame
+            transformed_points = self.transform_points_to_world_frame(points, current_pose)
+            
             # Rotate points for ROS coordinate system
-            rotated_points = self.rotate_points(points)
+            rotated_points = self.rotate_points(transformed_points)
 
-            # Accumulate points and colors
-            if not hasattr(self, 'accumulated_colors'):
-                self.accumulated_colors = []
+            # Store points, colors, and pose for accumulation
             self.accumulated_points.append(rotated_points)
             self.accumulated_colors.append(colors)
+            self.accumulated_poses.append(current_pose)
+
+            # Clear accumulated data periodically to prevent memory issues and allow fresh 360° reconstruction
+            max_frames = self.get_parameter('max_accumulated_frames').value
+            if len(self.accumulated_points) >= max_frames:
+                self.get_logger().info(f"Clearing accumulated point cloud after {len(self.accumulated_points)} frames")
+                # Keep last half for smooth transition
+                keep_frames = max_frames // 2
+                self.accumulated_points = self.accumulated_points[-keep_frames:]
+                self.accumulated_colors = self.accumulated_colors[-keep_frames:]
+                self.accumulated_poses = self.accumulated_poses[-keep_frames:]
 
             # Concatenate all accumulated points and colors
-            accumulated_point_cloud = np.concatenate(self.accumulated_points, axis=0)
-            accumulated_colors = np.concatenate(self.accumulated_colors, axis=0)
+            if len(self.accumulated_points) > 0:
+                accumulated_point_cloud = np.concatenate(self.accumulated_points, axis=0)
+                accumulated_colors = np.concatenate(self.accumulated_colors, axis=0)
 
-            if accumulated_point_cloud.size == 0:
-                return
+                if accumulated_point_cloud.size == 0:
+                    return
 
-            # Downsample the point cloud and colors
-            voxel_size = self.get_parameter('voxel_size').value if self.has_parameter('voxel_size') else 0.05
-            downsampled_points, downsampled_colors = self.voxel_grid_downsample(
-                accumulated_point_cloud, accumulated_colors, voxel_size
-            )
+                # Downsample the point cloud and colors
+                voxel_size = self.get_parameter('voxel_size').value if self.has_parameter('voxel_size') else 0.05
+                downsampled_points, downsampled_colors = self.voxel_grid_downsample(
+                    accumulated_point_cloud, accumulated_colors, voxel_size
+                )
 
-            # Create colored PointCloud2 message
-            header = std_msgs.msg.Header()
-            header.stamp = self.get_clock().now().to_msg()
-            header.frame_id = "map"
+                # Create colored PointCloud2 message
+                header = std_msgs.msg.Header()
+                header.stamp = self.get_clock().now().to_msg()
+                header.frame_id = "map"
 
-            pc2_msg = self.create_colored_pointcloud2(downsampled_points, downsampled_colors, header)
-            self.pointcloud_publisher.publish(pc2_msg)
+                pc2_msg = self.create_colored_pointcloud2(downsampled_points, downsampled_colors, header)
+                self.pointcloud_publisher.publish(pc2_msg)
 
-            self.get_logger().info(
-                f"Published {len(downsampled_points)} colored points (downsampled from {len(accumulated_point_cloud)})"
-            )
+                self.get_logger().info(
+                    f"Published {len(downsampled_points)} colored points (downsampled from {len(accumulated_point_cloud)}) from {len(self.accumulated_points)} frames"
+                )
 
         except Exception as e:
             self.get_logger().error(f"Failed to publish accumulated point cloud: {e}")
